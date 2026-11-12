@@ -1,0 +1,724 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Monitoring for an Amazon WorkSpaces Personal directory. (1) Alarm when N or
+  more WorkSpaces are unhealthy. (2) Optional alarm on the directory-wide
+  connection failure rate. (3) Optional alarms when any WorkSpace's root or
+  user volume is above a disk usage threshold. (4) Optional Lambda that runs
+  when any alarm fires and emails the affected WorkSpaces, with an alarm on
+  its errors.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: WorkSpaces }
+        Parameters: [DirectoryId]
+      - Label: { default: Unhealthy WorkSpaces alarm }
+        Parameters: [AlarmName, UnhealthyThreshold, EvaluationPeriods]
+      - Label: { default: Connection failure rate alarm }
+        Parameters:
+          - EnableConnectionFailureAlarm
+          - ConnectionFailureRateThreshold
+          - ConnectionMinAttempts
+      - Label: { default: Disk usage alarms }
+        Parameters:
+          - EnableDiskUsageAlarms
+          - DiskUsageThreshold
+          - DiskEvaluationPeriods
+      - Label: { default: Notifications }
+        Parameters: [ExistingTopicArn, TopicName, TopicKmsKeyArn, NotificationEmail, NotifyOnOk]
+      - Label: { default: Alarm details }
+        Parameters: [EnableAlarmDetails]
+    ParameterLabels:
+      DirectoryId: { default: WorkSpaces directory ID }
+      AlarmName: { default: Unhealthy alarm name (optional) }
+      UnhealthyThreshold: { default: Unhealthy WorkSpaces threshold }
+      EvaluationPeriods: { default: Consecutive 5-minute periods }
+      EnableConnectionFailureAlarm: { default: Create connection failure rate alarm }
+      ConnectionFailureRateThreshold: { default: Connection failure rate threshold (%) }
+      ConnectionMinAttempts: { default: Minimum connection attempts per 5 minutes }
+      EnableDiskUsageAlarms: { default: Create disk usage alarms }
+      DiskUsageThreshold: { default: Disk usage threshold (%) }
+      DiskEvaluationPeriods: { default: Consecutive 5-minute periods for disk alarms }
+      EnableAlarmDetails: { default: Email the affected WorkSpaces when an alarm fires }
+      ExistingTopicArn: { default: Existing SNS topic ARN (optional) }
+      TopicName: { default: New SNS topic name (optional) }
+      TopicKmsKeyArn: { default: Topic KMS key ARN (optional) }
+      NotificationEmail: { default: Notification email (optional) }
+      NotifyOnOk: { default: Notify when alarms return to OK }
+
+Parameters:
+  DirectoryId:
+    Type: String
+    Description: ID of the WorkSpaces directory to monitor, e.g. d-1234567890.
+    AllowedPattern: "^d-[0-9a-f]{8,63}$"
+    ConstraintDescription: Must be a directory ID in the form d-xxxxxxxxxx.
+
+  # ---------- Unhealthy alarm ----------
+  AlarmName:
+    Type: String
+    Description: >-
+      Name of the unhealthy alarm. Leave empty to use
+      WorkSpaces-<DirectoryId>-Unhealthy.
+    Default: ""
+    MaxLength: 255
+
+  UnhealthyThreshold:
+    Type: Number
+    Description: >-
+      Alarm when this many or more WorkSpaces are unhealthy. 1 = alert on any
+      unhealthy WorkSpace; raise it to alert only on wider problems.
+    Default: 1
+    MinValue: 1
+
+  EvaluationPeriods:
+    Type: Number
+    Description: >-
+      Consecutive 5-minute periods the unhealthy and connection failure
+      thresholds must be met before alarming. 1 = alert immediately,
+      2 = ~10 minutes (filters reboots and short blips).
+    Default: 1
+    MinValue: 1
+    MaxValue: 12
+
+  # ---------- Connection failure rate alarm ----------
+  EnableConnectionFailureAlarm:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  ConnectionFailureRateThreshold:
+    Type: Number
+    Description: >-
+      Alarm when this percentage or more of connection attempts in the
+      directory fail (ConnectionFailure / ConnectionAttempt).
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+
+  ConnectionMinAttempts:
+    Type: Number
+    Description: >-
+      Only evaluate the failure rate when there are at least this many
+      connection attempts in a 5-minute period, so 1 failure out of 2
+      attempts does not alarm.
+    Default: 5
+    MinValue: 1
+
+  # ---------- Disk usage alarms ----------
+  EnableDiskUsageAlarms:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  DiskUsageThreshold:
+    Type: Number
+    Description: >-
+      Alarm when any WorkSpace's root or user volume usage is above this
+      percentage. Maximum 99, because the alarm fires only above the
+      threshold and usage cannot exceed 100%.
+    Default: 90
+    MinValue: 1
+    MaxValue: 99
+
+  DiskEvaluationPeriods:
+    Type: Number
+    Description: >-
+      Consecutive 5-minute periods a volume must be above the disk threshold
+      before alarming. 1 = alert immediately; raise it to filter short spikes
+      such as temporary files during updates.
+    Default: 1
+    MinValue: 1
+    MaxValue: 12
+
+  # ---------- Notifications ----------
+  ExistingTopicArn:
+    Type: String
+    Description: >-
+      ARN of an existing SNS topic to notify. Leave empty to create a new topic.
+      If EnableAlarmDetails is true, the details function also publishes plain
+      text (not CloudWatch alarm JSON) to this topic, so it should have only
+      email subscribers. Lambda, SQS, HTTPS, or chat subscribers that parse
+      alarm JSON can fail on these messages; set EnableAlarmDetails to false
+      for such topics.
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]{1,256}$"
+    ConstraintDescription: Must be empty or a valid SNS topic ARN.
+
+  TopicName:
+    Type: String
+    Description: >-
+      Name for the new SNS topic (ignored if ExistingTopicArn is set). Leave
+      empty to let CloudFormation generate a unique name.
+    Default: ""
+    AllowedPattern: "^[A-Za-z0-9_-]{0,256}$"
+
+  TopicKmsKeyArn:
+    Type: String
+    Description: >-
+      ARN of the customer managed KMS key that encrypts the topic. Leave empty
+      for an unencrypted topic. With ExistingTopicArn, set this to the key the
+      existing topic uses. Without it, the new topic is encrypted with this
+      key. The key policy must allow cloudwatch.amazonaws.com kms:Decrypt and
+      kms:GenerateDataKey*. The AWS managed key (alias/aws/sns) is not
+      supported because CloudWatch cannot use it. If EnableAlarmDetails is
+      true, the key policy must also let the AlarmDetailsRole IAM role use
+      kms:GenerateDataKey* and kms:Decrypt, otherwise the details publish
+      fails silently except for AlarmDetailsErrorsAlarm.
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$"
+    ConstraintDescription: Must be empty or a KMS key ARN (not an alias).
+
+  NotificationEmail:
+    Type: String
+    Description: >-
+      Email address to subscribe to the topic. Leave empty to skip. The
+      recipient must confirm the subscription from the email AWS sends.
+    Default: ""
+    AllowedPattern: "^$|^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+    ConstraintDescription: Must be empty or a valid email address.
+
+  NotifyOnOk:
+    Type: String
+    Description: Also send a notification when an alarm recovers to OK.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+
+  # ---------- Alarm details ----------
+  EnableAlarmDetails:
+    Type: String
+    Description: >-
+      When an alarm enters ALARM, run a Lambda function that finds the
+      affected WorkSpaces (unhealthy, connection failures, or volumes over
+      the disk threshold) and publishes them to the alert topic as plain
+      text. Use only with topics that have email subscribers (see
+      ExistingTopicArn). Requires CAPABILITY_IAM.
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+Conditions:
+  CreateTopic: !Equals [!Ref ExistingTopicArn, ""]
+  HasTopicName: !Not [!Equals [!Ref TopicName, ""]]
+  HasTopicKey: !Not [!Equals [!Ref TopicKmsKeyArn, ""]]
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  HasAlarmName: !Not [!Equals [!Ref AlarmName, ""]]
+  SendOkNotification: !Equals [!Ref NotifyOnOk, "true"]
+  CreateConnectionAlarm: !Equals [!Ref EnableConnectionFailureAlarm, "true"]
+  CreateDiskAlarms: !Equals [!Ref EnableDiskUsageAlarms, "true"]
+  CreateAlarmDetails: !Equals [!Ref EnableAlarmDetails, "true"]
+
+Resources:
+  # ======================= Notifications =======================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTopic
+    Properties:
+      TopicName: !If [HasTopicName, !Ref TopicName, !Ref AWS::NoValue]
+      DisplayName: WorkSpaces Alerts
+      KmsMasterKeyId: !If [HasTopicKey, !Ref TopicKmsKeyArn, !Ref AWS::NoValue]
+
+  # Replaces the default topic policy, which allows any principal in the
+  # account that has IAM permissions. Same-account IAM principals (the Lambda
+  # role, administrators) still get access through their IAM policies, so no
+  # statement is needed for them. Other accounts get no access. Only applied to
+  # a topic this stack creates; an existing topic's policy is left unchanged.
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateTopic
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CloudWatch alarms publish as the cloudwatch.amazonaws.com service
+          # principal, which needs an explicit allow. The source conditions
+          # limit it to alarms in this account and Region (confused deputy
+          # protection). A wildcard is used instead of the exact alarm ARNs
+          # because CloudWatch requires aws:SourceAccount alone for alarm
+          # names with non-ASCII characters, which AlarmName allows.
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          # Reject publishes over plain HTTP. Requests without the key are not
+          # matched, so service-principal publishes are unaffected.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+
+  # ======================= 1. Unhealthy WorkSpaces =======================
+  UnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !If
+        - HasAlarmName
+        - !Ref AlarmName
+        - !Sub "WorkSpaces-${DirectoryId}-Unhealthy"
+      AlarmDescription: !Sub >-
+        ${UnhealthyThreshold} or more WorkSpaces in directory ${DirectoryId}
+        were unhealthy for ${EvaluationPeriods} consecutive 5-minute period(s).
+        Run: aws workspaces describe-workspaces --directory-id ${DirectoryId}
+        --region ${AWS::Region} --query "Workspaces[?State=='UNHEALTHY']"
+      Namespace: AWS/WorkSpaces
+      MetricName: Unhealthy
+      Dimensions:
+        - Name: DirectoryId
+          Value: !Ref DirectoryId
+      # Sum over 300s = number of unhealthy WorkSpaces. Do not change the
+      # period: longer periods double-count, Maximum never exceeds 1.
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: !Ref EvaluationPeriods
+      DatapointsToAlarm: !Ref EvaluationPeriods
+      Threshold: !Ref UnhealthyThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+      OKActions: !If
+        - SendOkNotification
+        - [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]]
+        - !Ref AWS::NoValue
+
+  # ======================= 2. Connection failure rate =======================
+  ConnectionFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateConnectionAlarm
+    Properties:
+      AlarmName: !Sub "WorkSpaces-${DirectoryId}-ConnectionFailureRate"
+      AlarmDescription: !Sub >-
+        ${ConnectionFailureRateThreshold}% or more of connection attempts to
+        WorkSpaces in directory ${DirectoryId} failed for ${EvaluationPeriods}
+        consecutive 5-minute period(s) (evaluated only when there were at
+        least ${ConnectionMinAttempts} attempts). Check per-WorkSpace
+        ConnectionFailure metrics (dimension WorkspaceId) to find affected
+        WorkSpaces.
+      Metrics:
+        - Id: failures
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/WorkSpaces
+              MetricName: ConnectionFailure
+              Dimensions:
+                - Name: DirectoryId
+                  Value: !Ref DirectoryId
+            Period: 300
+            Stat: Sum
+        - Id: attempts
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/WorkSpaces
+              MetricName: ConnectionAttempt
+              Dimensions:
+                - Name: DirectoryId
+                  Value: !Ref DirectoryId
+            Period: 300
+            Stat: Sum
+        - Id: failureRate
+          Label: Connection failure rate (%)
+          ReturnData: true
+          # FILL(failures): periods with attempts but no failure datapoint count as 0 failures.
+          # FILL(attempts): periods with no attempts count as 0 attempts, so they
+          # report 0 (not breaching) instead of being skipped. A skipped period
+          # would let breaching periods on either side of it count as consecutive.
+          # IF: below the minimum attempts, report 0 instead of a noisy rate.
+          Expression: !Sub "IF(FILL(attempts, 0) >= ${ConnectionMinAttempts}, 100 * FILL(failures, 0) / FILL(attempts, 0), 0)"
+      EvaluationPeriods: !Ref EvaluationPeriods
+      DatapointsToAlarm: !Ref EvaluationPeriods
+      Threshold: !Ref ConnectionFailureRateThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+      OKActions: !If
+        - SendOkNotification
+        - [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]]
+        - !Ref AWS::NoValue
+
+  # ======================= 3. Disk usage =======================
+  # Each running WorkSpace adds its own datapoint every 5 minutes to the
+  # DirectoryId-dimensioned disk metrics, so Maximum over 300s is the highest
+  # usage of any WorkSpace in the directory. These alarms fire when ANY one
+  # WorkSpace is over the threshold; they cannot count how many are.
+  RootVolumeDiskUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateDiskAlarms
+    Properties:
+      AlarmName: !Sub "WorkSpaces-${DirectoryId}-RootVolumeDiskUsage"
+      AlarmDescription: !Sub >-
+        At least one WorkSpace in directory ${DirectoryId} has root volume
+        usage above ${DiskUsageThreshold}% for ${DiskEvaluationPeriods}
+        consecutive 5-minute period(s). Find it in CloudWatch: AWS/WorkSpaces
+        RootVolumeDiskUsage by WorkspaceId, sorted by Maximum.
+      Namespace: AWS/WorkSpaces
+      MetricName: RootVolumeDiskUsage
+      Dimensions:
+        - Name: DirectoryId
+          Value: !Ref DirectoryId
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref DiskEvaluationPeriods
+      DatapointsToAlarm: !Ref DiskEvaluationPeriods
+      Threshold: !Ref DiskUsageThreshold
+      ComparisonOperator: GreaterThanThreshold
+      # Stopped WorkSpaces publish no disk metrics. No running WorkSpaces = OK.
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+      OKActions: !If
+        - SendOkNotification
+        - [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]]
+        - !Ref AWS::NoValue
+
+  UserVolumeDiskUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateDiskAlarms
+    Properties:
+      AlarmName: !Sub "WorkSpaces-${DirectoryId}-UserVolumeDiskUsage"
+      AlarmDescription: !Sub >-
+        At least one WorkSpace in directory ${DirectoryId} has user volume
+        usage above ${DiskUsageThreshold}% for ${DiskEvaluationPeriods}
+        consecutive 5-minute period(s). Find it in CloudWatch: AWS/WorkSpaces
+        UserVolumeDiskUsage by WorkspaceId, sorted by Maximum.
+      Namespace: AWS/WorkSpaces
+      MetricName: UserVolumeDiskUsage
+      Dimensions:
+        - Name: DirectoryId
+          Value: !Ref DirectoryId
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: !Ref DiskEvaluationPeriods
+      DatapointsToAlarm: !Ref DiskEvaluationPeriods
+      Threshold: !Ref DiskUsageThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+      OKActions: !If
+        - SendOkNotification
+        - [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]]
+        - !Ref AWS::NoValue
+
+  # ======================= 4. Alarm details lookup =======================
+  AlarmDetailsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateAlarmDetails
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/workspaces/${AWS::StackName}/alarm-details"
+      RetentionInDays: 30
+
+  AlarmDetailsRole:
+    Type: AWS::IAM::Role
+    Condition: CreateAlarmDetails
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AlarmDetails
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # DescribeWorkspaces and GetMetricData do not support resource-level
+              # permissions, so "*" is required; a narrower ARN would deny them.
+              - Sid: ListWorkSpaces
+                Effect: Allow
+                Action: workspaces:DescribeWorkspaces
+                Resource: "*"
+              - Sid: ReadMetrics
+                Effect: Allow
+                Action: cloudwatch:GetMetricData
+                Resource: "*"
+              - Sid: PublishAlert
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+              - !If
+                - HasTopicKey
+                - Sid: EncryptAlert
+                  Effect: Allow
+                  Action: [kms:GenerateDataKey*, kms:Decrypt]
+                  Resource: !Ref TopicKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub "sns.${AWS::Region}.amazonaws.com"
+                - !Ref AWS::NoValue
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt AlarmDetailsLogGroup.Arn
+
+  AlarmDetailsFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateAlarmDetails
+    Properties:
+      Description: !Sub "Lists the affected WorkSpaces in ${DirectoryId} when a WorkSpaces alarm fires"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt AlarmDetailsRole.Arn
+      # Lambda maximum. Large fleets with throttling retries can need several
+      # minutes; billing is per actual run time, so this only removes the cap.
+      Timeout: 900
+      MemorySize: 256
+      # One run at a time. Each run lists the whole fleet with the low-rate
+      # DescribeWorkspaces API, so alarms firing together (plus EventBridge
+      # retries) would otherwise run in parallel and throttle each other.
+      # Async invocations that hit this limit are queued and retried by Lambda
+      # (up to 6 hours), not dropped. Requires 1 unit of unreserved account
+      # concurrency; deployment fails if that would leave fewer than 100.
+      ReservedConcurrentExecutions: 1
+      LoggingConfig:
+        LogGroup: !Ref AlarmDetailsLogGroup
+      Environment:
+        Variables:
+          DIRECTORY_ID: !Ref DirectoryId
+          DISK_THRESHOLD: !Ref DiskUsageThreshold
+          TOPIC_ARN: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+          EVALUATION_PERIODS: !Ref EvaluationPeriods
+          # Passed as a plain value, not embedded in JSON, so any valid alarm
+          # name (including quotes or backslashes) is safe.
+          UNHEALTHY_ALARM: !If
+            - HasAlarmName
+            - !Ref AlarmName
+            - !Sub "WorkSpaces-${DirectoryId}-Unhealthy"
+          CONNECTION_ALARM: !Ref EnableConnectionFailureAlarm
+          DISK_ALARMS: !Ref EnableDiskUsageAlarms
+      Code:
+        ZipFile: |
+          import datetime as dt, json, os
+          import boto3
+          from botocore.config import Config
+
+          # DescribeWorkspaces returns at most 25 WorkSpaces per page and has low
+          # rate limits, so large fleets need many calls. Adaptive retries back
+          # off and rate-limit on throttling instead of failing the run.
+          RETRY = Config(retries={"mode": "adaptive", "max_attempts": 10})
+          ws, cw, sns = (boto3.client(s, config=RETRY) for s in ("workspaces", "cloudwatch", "sns"))
+          E = os.environ
+          DIR, TOPIC = E["DIRECTORY_ID"], E["TOPIC_ARN"]
+          # Window for connection failure totals: the whole connection alarm
+          # window (5 minutes per evaluation period), and at least 30 minutes
+          # so short alarm windows still catch recent failures.
+          MIN = max(30, 5 * int(E["EVALUATION_PERIODS"]))
+          # Window for latest disk usage. Short enough that WorkSpaces that
+          # stopped earlier (and so are not seen by the disk alarms) are left
+          # out, long enough to include a running WorkSpace's latest 5-minute
+          # datapoint despite publishing delay.
+          DISK_MIN = 15
+          DISK = float(E["DISK_THRESHOLD"])
+          KINDS = {E["UNHEALTHY_ALARM"]: "unhealthy"}
+          if E["CONNECTION_ALARM"] == "true":
+              KINDS[f"WorkSpaces-{DIR}-ConnectionFailureRate"] = "connection"
+          if E["DISK_ALARMS"] == "true":
+              KINDS[f"WorkSpaces-{DIR}-RootVolumeDiskUsage"] = "root"
+              KINDS[f"WorkSpaces-{DIR}-UserVolumeDiskUsage"] = "user"
+          VOL = {"root": "RootVolumeDiskUsage", "user": "UserVolumeDiskUsage"}
+          # SNS messages (and email deliveries) are limited to 256 KiB (262,144 bytes).
+          # Budget for WorkSpace rows, leaving headroom for the headers and notes,
+          # and keeping the JSON log line below the 256 KB CloudWatch Logs event limit.
+          ROW_BYTES = 200_000
+
+          def values(ids, metric, stat, minutes=MIN):
+              # Per-WorkSpace 5-minute values, newest first, for the last `minutes`.
+              ids, out = list(ids), {}
+              end = dt.datetime.now(dt.timezone.utc)
+              for i in range(0, len(ids), 500):  # GetMetricData limit: 500 queries
+                  args = {"StartTime": end - dt.timedelta(minutes=minutes), "EndTime": end,
+                          "ScanBy": "TimestampDescending", "MetricDataQueries": [
+                      {"Id": f"q{j}", "MetricStat": {"Period": 300, "Stat": stat, "Metric": {
+                          "Namespace": "AWS/WorkSpaces", "MetricName": metric,
+                          "Dimensions": [{"Name": "WorkspaceId", "Value": w}]}}}
+                      for j, w in enumerate(ids[i:i + 500], i)]}
+                  while True:
+                      r = cw.get_metric_data(**args)
+                      for m in r["MetricDataResults"]:
+                          out.setdefault(ids[int(m["Id"][1:])], []).extend(m["Values"])
+                      if "NextToken" not in r:
+                          break
+                      args["NextToken"] = r["NextToken"]
+              return {w: v for w, v in out.items() if v}
+
+          def who(w):
+              return f"{w['WorkspaceId']}  user={w.get('UserName', '')}"
+
+          def unhealthy(wss):
+              bad = [w for w in wss.values() if w["State"] in ("UNHEALTHY", "IMPAIRED")]
+              # Includes IMPAIRED, which the Unhealthy metric does not count, so
+              # this list can be longer than the alarm's count.
+              return "Unhealthy or impaired WorkSpaces", [(w["WorkspaceId"], f"{who(w)}  state={w['State']}")
+                                                          for w in bad]
+
+          def connection(wss):
+              f, a = values(wss, "ConnectionFailure", "Sum"), values(wss, "ConnectionAttempt", "Sum")
+              rows = sorted(((sum(v), sum(a.get(w, [])), w) for w, v in f.items() if sum(v) > 0), reverse=True)
+              return (f"WorkSpaces with connection failures in the last {MIN} minutes",
+                      [(w, f"{who(wss[w])}  failures={n:g}  attempts={t:g}") for n, t, w in rows])
+
+          def disk(wss, vol):
+              rows = sorted(((v[0], w) for w, v in values(wss, VOL[vol], "Maximum", DISK_MIN).items()
+                             if v[0] > DISK), reverse=True)
+              return (f"WorkSpaces with {vol} volume usage above {DISK:g}%",
+                      [(w, f"{who(wss[w])}  {vol} volume={p:.1f}%") for p, w in rows])
+
+          def handler(event, context):
+              alarm = event.get("detail", {}).get("alarmName", "")
+              # One check for an alarm event; every check for a manual invoke.
+              kinds = [KINDS[alarm]] if alarm in KINDS else list(dict.fromkeys(KINDS.values()))
+              wss = {w["WorkspaceId"]: w
+                     for p in ws.get_paginator("describe_workspaces").paginate(DirectoryId=DIR)
+                     for w in p["Workspaces"]}
+              lines, found = [f"Alarm: {alarm or 'manual run'}", f"Directory: {DIR}"], 0
+              budget, omitted, logged = ROW_BYTES, 0, {}
+              for k in kinds:
+                  # Each check returns (WorkspaceId, email row) pairs.
+                  title, rows = (unhealthy(wss) if k == "unhealthy" else
+                                 connection(wss) if k == "connection" else disk(wss, k))
+                  found += len(rows)
+                  logged[k] = []
+                  lines += ["", f"{title}: {len(rows)}"]
+                  if not rows:
+                      lines.append("None found now. The issue may have cleared, or the WorkSpace may be stopped.")
+                  for i, (wid, row) in enumerate(rows):
+                      budget -= len(row.encode()) + 1
+                      if budget < 0:
+                          omitted += len(rows) - i
+                          lines.append(f"... and {len(rows) - i} more not listed (message size limit).")
+                          break
+                      lines.append(row)
+                      logged[k].append(wid)
+              if omitted:
+                  lines += ["", f"Message truncated: {omitted} of {found} affected WorkSpace entries are not "
+                            "listed because SNS messages are limited to 256 KiB. The counts above are "
+                            "complete; use the per-WorkSpace metrics in CloudWatch to see the rest."]
+              sns.publish(TopicArn=TOPIC, Message="\n".join(lines),
+                          # SNS subjects must be shorter than 100 characters.
+                          Subject=f"WorkSpaces {DIR} alarm details: {', '.join(kinds)}"[:99])
+              # Log WorkSpace IDs only, not usernames, so the log
+              # group holds no user identifiers. Only IDs listed in the email are
+              # logged, which keeps the line within the ROW_BYTES budget and below
+              # the CloudWatch Logs event limit.
+              print(json.dumps({"alarm": alarm, "kinds": kinds, "affected": found,
+                                "omitted": omitted, "workspaceIds": logged}))
+              return {"alarm": alarm, "kinds": kinds, "affected": found, "omitted": omitted}
+
+  AlarmDetailsRule:
+    Type: AWS::Events::Rule
+    Condition: CreateAlarmDetails
+    Properties:
+      Description: !Sub "Runs the alarm details lookup when a WorkSpaces alarm for ${DirectoryId} enters ALARM"
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        resources:
+          - !GetAtt UnhealthyAlarm.Arn
+          - !If [CreateConnectionAlarm, !GetAtt ConnectionFailureRateAlarm.Arn, !Ref AWS::NoValue]
+          - !If [CreateDiskAlarms, !GetAtt RootVolumeDiskUsageAlarm.Arn, !Ref AWS::NoValue]
+          - !If [CreateDiskAlarms, !GetAtt UserVolumeDiskUsageAlarm.Arn, !Ref AWS::NoValue]
+        detail:
+          state:
+            value: [ALARM]
+      State: ENABLED
+      Targets:
+        - Id: AlarmDetailsFunction
+          Arn: !GetAtt AlarmDetailsFunction.Arn
+
+  AlarmDetailsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateAlarmDetails
+    Properties:
+      FunctionName: !Ref AlarmDetailsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmDetailsRule.Arn
+
+  # EventBridge invokes the function asynchronously: a failed run is retried
+  # twice and then dropped. Alarm on any error (including timeouts) so a
+  # missing details email is noticed. Not in AlarmDetailsRule, so it never
+  # invokes the function itself.
+  AlarmDetailsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateAlarmDetails
+    Properties:
+      AlarmName: !Sub "WorkSpaces-${DirectoryId}-AlarmDetailsErrors"
+      AlarmDescription: !Sub >-
+        The alarm details function ${AlarmDetailsFunction} failed, so an
+        affected-WorkSpaces email may not have been sent. The WorkSpaces
+        alarm notifications are not affected. Check the log group
+        /workspaces/${AWS::StackName}/alarm-details.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AlarmDetailsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # The function runs only when an alarm fires; no invocations = OK.
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+      OKActions: !If
+        - SendOkNotification
+        - [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]]
+        - !Ref AWS::NoValue
+
+Outputs:
+  TopicArn:
+    Description: SNS topic the alarms notify.
+    Value: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingTopicArn]
+  AlarmName:
+    Description: Name of the unhealthy WorkSpaces alarm.
+    Value: !Ref UnhealthyAlarm
+  AlarmArn:
+    Description: ARN of the unhealthy WorkSpaces alarm.
+    Value: !GetAtt UnhealthyAlarm.Arn
+  ConnectionFailureRateAlarmName:
+    Condition: CreateConnectionAlarm
+    Description: Name of the connection failure rate alarm.
+    Value: !Ref ConnectionFailureRateAlarm
+  RootVolumeDiskUsageAlarmName:
+    Condition: CreateDiskAlarms
+    Description: Name of the root volume disk usage alarm.
+    Value: !Ref RootVolumeDiskUsageAlarm
+  UserVolumeDiskUsageAlarmName:
+    Condition: CreateDiskAlarms
+    Description: Name of the user volume disk usage alarm.
+    Value: !Ref UserVolumeDiskUsageAlarm
+  AlarmDetailsFunctionName:
+    Condition: CreateAlarmDetails
+    Description: >-
+      Lambda that publishes the affected WorkSpaces when an alarm fires.
+      Invoke it with an empty event to run every check on demand.
+    Value: !Ref AlarmDetailsFunction
+  AlarmDetailsErrorsAlarmName:
+    Condition: CreateAlarmDetails
+    Description: Name of the alarm that fires when the alarm details function fails.
+    Value: !Ref AlarmDetailsErrorsAlarm
