@@ -1,11 +1,8 @@
 ## My Project
 
-TODO: Fill this README out!
+CloudFormation template to monitor an entire Amazon WorkSpaces Personal fleet with four directory-level CloudWatch alarms, at a fixed cost for any fleet size, and get an email listing the affected WorkSpaces when an alarm fires.
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+For details refer to Builder Center article: {wip}
 
 ## Security
 
